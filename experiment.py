@@ -11,8 +11,8 @@ import torch.distributed as dist
 from sklearn.model_selection import KFold, train_test_split
 from collections import defaultdict
 
-from rrl.utils import read_csv, DBEncoder
-from rrl.models import RRL
+from rrl_sae_wc.rrl.utils import read_csv, DBEncoder
+from rrl_sae_wc.rrl.models import RRL
 
 DATA_DIR = './dataset'
 
@@ -105,6 +105,7 @@ def train_model(gpu, args):
 def load_model(path, device_id, log_file=None, distributed=True):
     checkpoint = torch.load(path, map_location='cpu')
     saved_args = checkpoint['rrl_args']
+    loss_params = checkpoint.get('loss_params', {})
     rrl = RRL(
         dim_list=saved_args['dim_list'],
         device_id=device_id,
@@ -115,13 +116,14 @@ def load_model(path, device_id, log_file=None, distributed=True):
         estimated_grad=saved_args['estimated_grad'],
         use_skip=saved_args['use_skip'],
         use_nlaf=saved_args['use_nlaf'],
-        alpha=saved_args['alpha'],
-        beta=saved_args['beta'],
-        gamma=saved_args['gamma'])
+        alpha_rrl=saved_args['alpha'],
+        beta_rrl=saved_args['beta'],
+        gamma_rrl=saved_args['gamma'],
+        **loss_params)
     stat_dict = checkpoint['model_state_dict']
-    for key in list(stat_dict.keys()):
-        # remove 'module.' prefix
-        stat_dict[key[7:]] = stat_dict.pop(key)
+    #for key in list(stat_dict.keys()):
+    #    # remove 'module.' prefix
+    #    stat_dict[key[7:]] = stat_dict.pop(key)
     rrl.net.load_state_dict(checkpoint['model_state_dict'])
     return rrl
 

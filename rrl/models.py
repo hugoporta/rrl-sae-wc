@@ -1,15 +1,26 @@
 import sys
 import logging
 import numpy as np
+import pyrootutils
 import torch
 import torch.nn as nn
 from sklearn import metrics
 from collections import defaultdict
+from torch.optim import LBFGS
 
-from rrl.components import BinarizeLayer
-from rrl.components import UnionLayer, LRLayer
+from rrl_sae_wc.rrl.components import BinarizeLayer
+from rrl_sae_wc.rrl.components import UnionLayer, LRLayer
 
-TEST_CNT_MOD = 500
+root = pyrootutils.setup_root(
+    search_from=__file__,
+    indicator=[".git", "pyproject.toml"],
+    pythonpath=True,
+    dotenv=True,
+)
+
+from src.model.loss import loss_factory
+
+#TEST_CNT_MOD = 500
 
 
 class Net(nn.Module):
@@ -92,16 +103,16 @@ class MyDistributedDataParallel(torch.nn.parallel.DistributedDataParallel):
 
 class RRL:
     def __init__(self, dim_list, device_id, use_not=False, is_rank0=False, log_file=None, writer=None, left=None,
-                 right=None, save_best=False, estimated_grad=False, save_path=None, distributed=True, use_skip=False, 
-                 use_nlaf=False, alpha=0.999, beta=8, gamma=1, temperature=0.01):
+                 right=None, save_best=False, estimated_grad=False, save_path=None, distributed=True, use_skip=False,
+                 use_nlaf=False, alpha_rrl=0.999, beta_rrl=8, gamma_rrl=1, temperature=0.01, **loss_params):
         super(RRL, self).__init__()
         self.dim_list = dim_list
         self.use_not = use_not
         self.use_skip = use_skip
         self.use_nlaf = use_nlaf
-        self.alpha =alpha
-        self.beta = beta
-        self.gamma = gamma
+        self.alpha = alpha_rrl
+        self.beta = beta_rrl
+        self.gamma = gamma_rrl
         self.best_f1 = -1.
         self.best_loss = 1e20
 
@@ -110,6 +121,9 @@ class RRL:
         self.save_best = save_best
         self.estimated_grad = estimated_grad
         self.save_path = save_path
+        self.loss_params = loss_params
+        self.criterion = loss_factory(**loss_params).cuda(self.device_id)
+
         if self.is_rank0:
             for handler in logging.root.handlers[:]:
                 logging.root.removeHandler(handler)
@@ -121,7 +135,7 @@ class RRL:
                 logging.basicConfig(level=logging.DEBUG, filename=log_file, filemode='w', format=log_format)
         self.writer = writer
 
-        self.net = Net(dim_list, use_not=use_not, left=left, right=right, use_nlaf=use_nlaf, estimated_grad=estimated_grad, use_skip=use_skip, alpha=alpha, beta=beta, gamma=gamma, temperature=temperature)
+        self.net = Net(dim_list, use_not=use_not, left=left, right=right, use_nlaf=use_nlaf, estimated_grad=estimated_grad, use_skip=use_skip, alpha=alpha_rrl, beta=beta_rrl, gamma=gamma_rrl, temperature=temperature)
         self.net.cuda(self.device_id)
         if distributed:
             self.net = MyDistributedDataParallel(self.net, device_ids=[self.device_id])
@@ -165,20 +179,17 @@ class RRL:
         return optimizer
 
     def train_model(self, data_loader=None, valid_loader=None, epoch=50, lr=0.01, lr_decay_epoch=100, 
-                    lr_decay_rate=0.75, weight_decay=0.0, log_iter=50):
+                    lr_decay_rate=0.75, weight_decay=0.0, log_iter=50, log_prefix=''):
 
         if data_loader is None:
             raise Exception("Data loader is unavailable!")
 
-        accuracy_b = []
-        f1_score_b = []
-
-        criterion = nn.CrossEntropyLoss().cuda(self.device_id)
         optimizer = torch.optim.Adam(self.net.parameters(), lr=lr, weight_decay=0.0)
 
         cnt = -1
         avg_batch_loss_rrl = 0.0
         epoch_histc = defaultdict(list)
+        TEST_CNT_MOD = epoch * len(data_loader) // 200
         for epo in range(epoch):
             optimizer = self.exp_lr_scheduler(optimizer, epo, init_lr=lr, lr_decay_rate=lr_decay_rate,
                                               lr_decay_epoch=lr_decay_epoch)
@@ -196,9 +207,10 @@ class RRL:
                 
                 # trainable softmax temperature
                 y_bar = self.net.forward(X) / torch.exp(self.net.t)
+                #y_bar = y_bar[:, 1]
                 y_arg = torch.argmax(y, dim=1)
-                
-                loss_rrl = criterion(y_bar, y_arg) + weight_decay * self.l2_penalty()
+
+                loss_rrl = self.criterion(y_bar, y_arg) + weight_decay * self.l2_penalty()
                 
                 ba_loss_rrl = loss_rrl.item()
                 epoch_loss_rrl += ba_loss_rrl
@@ -209,10 +221,10 @@ class RRL:
                 cnt += 1
                 with torch.no_grad():
                     if self.is_rank0 and cnt % log_iter == 0 and cnt != 0 and self.writer is not None:
-                        self.writer.add_scalar('Avg_Batch_Loss_GradGrafting', avg_batch_loss_rrl / log_iter, cnt)
                         edge_p = self.edge_penalty().item()
-                        self.writer.add_scalar('Edge_penalty/Log', np.log(edge_p), cnt)
-                        self.writer.add_scalar('Edge_penalty/Origin', edge_p, cnt)
+                        self.writer.log({f'{log_prefix}train/Avg_Batch_Loss_GradGrafting': avg_batch_loss_rrl / log_iter,
+                                         f'{log_prefix}train/Edge_penalty_log': np.log(edge_p),
+                                         f'{log_prefix}train/Edge_penalty_origin': edge_p}, step=cnt)
                         avg_batch_loss_rrl = 0.0
 
                 optimizer.step()
@@ -223,37 +235,76 @@ class RRL:
                         abs_gradient_avg += torch.sum(torch.abs(param.grad)) / (param.grad.numel())
                 self.clip()
 
-                if self.is_rank0 and (cnt % (TEST_CNT_MOD * (1 if self.save_best else 10)) == 0):
+                if self.is_rank0 and (cnt % (TEST_CNT_MOD * 10) == 0):
                     if valid_loader is not None:
-                        acc_b, f1_b = self.test(test_loader=valid_loader, set_name='Validation')
-                    else: # use the data_loader as the valid loader
-                        acc_b, f1_b = self.test(test_loader=data_loader, set_name='Training')
-                    
+                        acc_b, f1_b, pr_b, rec_b = self.test(test_loader=valid_loader, set_name='Validation')
+
+                    acc_b_train, f1_b_train, pr_b_train, rec_b_train = self.test(test_loader=data_loader, set_name='Training')
+
                     if self.save_best and (f1_b > self.best_f1 or (np.abs(f1_b - self.best_f1) < 1e-10 and self.best_loss > epoch_loss_rrl)):
                         self.best_f1 = f1_b
                         self.best_loss = epoch_loss_rrl
                         self.save_model()
-                    
-                    accuracy_b.append(acc_b)
-                    f1_score_b.append(f1_b)
+
                     if self.writer is not None:
-                        self.writer.add_scalar('Accuracy_RRL', acc_b, cnt // TEST_CNT_MOD)
-                        self.writer.add_scalar('F1_Score_RRL', f1_b, cnt // TEST_CNT_MOD)
+                        self.writer.log({f'{log_prefix}train/Accuracy_RRL': acc_b_train, f'{log_prefix}train/F1_Score_RRL': f1_b_train,
+                                         f'{log_prefix}train/Precision_RRL': pr_b_train, f'{log_prefix}train/Recall_RRL': rec_b_train}, step=cnt)
+                        self.writer.log({f'{log_prefix}val/Accuracy_RRL': acc_b, f'{log_prefix}val/F1_Score_RRL': f1_b,
+                                         f'{log_prefix}val/Precision_RRL': pr_b, f'{log_prefix}val/Recall_RRL': rec_b}, step=cnt)
+
             if self.is_rank0:
                 logging.info('epoch: {}, loss_rrl: {}'.format(epo, epoch_loss_rrl))
                 if self.writer is not None:
-                    self.writer.add_scalar('Training_Loss_RRL', epoch_loss_rrl, epo)
-                    self.writer.add_scalar('Abs_Gradient_Max', abs_gradient_max, epo)
-                    self.writer.add_scalar('Abs_Gradient_Avg', abs_gradient_avg / ba_cnt, epo)
+                    self.writer.log({f'{log_prefix}train/Epoch_Loss_RRL': epoch_loss_rrl,
+                                     f'{log_prefix}train/Abs_Gradient_Max': abs_gradient_max,
+                                     f'{log_prefix}train/Abs_Gradient_Avg': abs_gradient_avg / ba_cnt,
+                                     }, step=cnt)
         if self.is_rank0 and not self.save_best:
             self.save_model()
-        return epoch_histc
+        return epoch_histc, {"val": {'accuracy': acc_b, 'f1': f1_b, 'prec': pr_b, 'rec': rec_b},
+                             "train": {'accuracy': acc_b_train, 'f1': f1_b_train, 'prec': pr_b_train, 'rec': rec_b_train}}
+
+    @torch.no_grad()
+    def collect_logits_labels(self, valid_loader):
+        """
+        Collect all logits and true labels from validation set
+        """
+        self.net.eval()
+        logits_list, labels_list = [], []
+        for X, y in valid_loader:
+            X, y = X.cuda(self.device_id, non_blocking=True), y.cuda(self.device_id, non_blocking=True)
+            logits = self.net.forward(X)
+            logits_list.append(logits)
+            labels_list.append(y)
+        logits = torch.cat(logits_list)
+        labels = torch.cat(labels_list)
+        return logits, labels
+
+
+    def fit_temperature(self, valid_loader, max_iter=50, lr=0.01):
+        logits, labels = self.collect_logits_labels(valid_loader)
+        optimizer = LBFGS([self.net.t], lr=lr, max_iter=max_iter)
+
+        self.net.eval()
+
+        print(f"Initial temperature: {torch.exp(self.net.t).item():.4f}")
+
+        def closure():
+            optimizer.zero_grad()
+            scaled_logits = logits / torch.exp(self.net.t)
+            loss = self.criterion(scaled_logits, labels)
+            loss.backward()
+            return loss
+
+        optimizer.step(closure)
+        print(f"Optimal temperature: {torch.exp(self.net.t).item():.4f}")
+
 
     @torch.no_grad()
     def test(self, test_loader=None, set_name='Validation'):
         if test_loader is None:
             raise Exception("Data loader is unavailable!")
-        
+
         y_list = []
         for X, y in test_loader:
             y_list.append(y)
@@ -268,7 +319,7 @@ class RRL:
         y_pred_b_list = []
         for X, y in test_loader:
             X = X.cuda(self.device_id, non_blocking=True)
-            output = self.net.forward(X)
+            output = self.net.forward(X) / torch.exp(self.net.t)
             y_pred_b_list.append(output)
 
         y_pred_b = torch.cat(y_pred_b_list).cpu().numpy()
@@ -277,7 +328,9 @@ class RRL:
         logging.debug('y_rrl: {} {}'.format(y_pred_b.shape, y_pred_b[:: (slice_step)]))
 
         accuracy_b = metrics.accuracy_score(y_true, y_pred_b_arg)
-        f1_score_b = metrics.f1_score(y_true, y_pred_b_arg, average='macro')
+        f1_score_b = metrics.f1_score(y_true, y_pred_b_arg, average='binary')
+        prec_score_b = metrics.precision_score(y_true, y_pred_b_arg, average='binary')
+        rec_score_b = metrics.recall_score(y_true, y_pred_b_arg, average='binary')
 
         logging.info('-' * 60)
         logging.info('On {} Set:\n\tAccuracy of RRL  Model: {}'
@@ -286,12 +339,19 @@ class RRL:
             set_name, metrics.confusion_matrix(y_true, y_pred_b_arg), metrics.classification_report(y_true, y_pred_b_arg)))
         logging.info('-' * 60)
 
-        return accuracy_b, f1_score_b
+        return accuracy_b, f1_score_b, prec_score_b, rec_score_b
 
     def save_model(self):
         rrl_args = {'dim_list': self.dim_list, 'use_not': self.use_not, 'use_skip': self.use_skip, 'estimated_grad': self.estimated_grad, 
                     'use_nlaf': self.use_nlaf, 'alpha': self.alpha, 'beta': self.beta, 'gamma': self.gamma}
-        torch.save({'model_state_dict': self.net.state_dict(), 'rrl_args': rrl_args}, self.save_path)
+
+        save_dict = {
+            'model_state_dict': self.net.state_dict(),
+            'rrl_args': rrl_args,
+        }
+        if hasattr(self, 'loss_params'):
+            save_dict['loss_params'] = self.loss_params
+        torch.save(save_dict, self.save_path)
 
     def detect_dead_node(self, data_loader=None):
         with torch.no_grad():
@@ -329,17 +389,17 @@ class RRL:
         if not display:
             return layer.rule2weights
         
-        print('RID', end='\t', file=file)
-        for i, ln in enumerate(label_name):
-            print('{}(b={:.4f})'.format(ln, layer.bl[i]), end='\t', file=file)
-        print('Support\tRule', file=file)
+        rule_lines = []
+        rule_lines.append('RID\t' + '\t'.join(['{}(b={:.4f})'.format(ln, layer.bl[i]) for i, ln in enumerate(label_name)]) + '\tSupport\tRule')
         for rid, w in layer.rule2weights:
-            print(rid, end='\t', file=file)
-            for li in range(len(label_name)):
-                print('{:.4f}'.format(w[li]), end='\t', file=file)
+            line = [str(rid)]
+            line += ['{:.4f}'.format(w[li]) for li in range(len(label_name))]
             now_layer = self.net.layer_list[-1 + rid[0]]
-            print('{:.4f}'.format((now_layer.node_activation_cnt[layer.rid2dim[rid]] / now_layer.forward_tot).item()),
-                  end='\t', file=file)
-            print(now_layer.rule_name[rid[1]], end='\n', file=file)
-        print('#' * 60, file=file)
-        return layer.rule2weights
+            support = (now_layer.node_activation_cnt[layer.rid2dim[rid]] / now_layer.forward_tot).item()
+            line.append('{:.4f}'.format(support))
+            line.append(str(now_layer.rule_name[rid[1]]))
+            rule_lines.append('\t'.join(line))
+        rule_lines.append('#' * 60)
+        rule_text = '\n'.join(rule_lines)
+        print(rule_text, file=file)
+        return layer.rule2weights, rule_text

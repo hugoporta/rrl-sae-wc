@@ -10,15 +10,8 @@ from torch.optim import LBFGS
 
 from rrl_sae_wc.rrl.components import BinarizeLayer
 from rrl_sae_wc.rrl.components import UnionLayer, LRLayer
-
-root = pyrootutils.setup_root(
-    search_from=__file__,
-    indicator=[".git", "pyproject.toml"],
-    pythonpath=True,
-    dotenv=True,
-)
-
 from src.model.loss import loss_factory
+from torch.utils.data import DataLoader
 
 #TEST_CNT_MOD = 500
 
@@ -104,7 +97,7 @@ class MyDistributedDataParallel(torch.nn.parallel.DistributedDataParallel):
 class RRL:
     def __init__(self, dim_list, device_id, use_not=False, is_rank0=False, log_file=None, writer=None, left=None,
                  right=None, save_best=False, estimated_grad=False, save_path=None, distributed=True, use_skip=False,
-                 use_nlaf=False, alpha_rrl=0.999, beta_rrl=8, gamma_rrl=1, temperature=0.01, **loss_params):
+                 use_nlaf=False, alpha_rrl=0.999, beta_rrl=8, gamma_rrl=1, temperature=0.01, batch_size=1024, **loss_params):
         super(RRL, self).__init__()
         self.dim_list = dim_list
         self.use_not = use_not
@@ -115,6 +108,7 @@ class RRL:
         self.gamma = gamma_rrl
         self.best_f1 = -1.
         self.best_loss = 1e20
+        self.batch_size = batch_size
 
         self.device_id = device_id
         self.is_rank0 = is_rank0
@@ -178,19 +172,34 @@ class RRL:
             param_group['lr'] = lr
         return optimizer
 
-    def train_model(self, data_loader=None, valid_loader=None, epoch=50, lr=0.01, lr_decay_epoch=100, 
-                    lr_decay_rate=0.75, weight_decay=0.0, log_iter=50, log_prefix=''):
+    def train_model(self, dataset=None, valid_loader=None, epoch=50, lr=0.01, lr_decay_epoch=100, 
+                    lr_decay_rate=0.75, weight_decay=0.0, log_iter=50, log_prefix='', use_weighted_sampler=False):
 
-        if data_loader is None:
-            raise Exception("Data loader is unavailable!")
+        if dataset is None:
+            raise Exception("Dataset is unavailable!")
 
         optimizer = torch.optim.Adam(self.net.parameters(), lr=lr, weight_decay=0.0)
 
         cnt = -1
         avg_batch_loss_rrl = 0.0
         epoch_histc = defaultdict(list)
-        TEST_CNT_MOD = epoch * len(data_loader) // 200
+        TEST_CNT_MOD = epoch * len(dataset) // (200 * self.batch_size)
+
         for epo in range(epoch):
+
+            if hasattr(dataset, 'resample'):
+                dataset.resample(epoch=epo)
+
+            if use_weighted_sampler and hasattr(dataset, 'class_weight'):
+                y_train_resample = np.argmax(dataset.y, axis=1) if (len(dataset.y.shape) > 1) and (dataset.y.shape[1] > 1) else dataset.y
+                samples_weight = np.array([float(dataset.class_weight[int(t)]) for t in y_train_resample])
+                samples_weight = torch.from_numpy(samples_weight)
+                sampler = torch.utils.data.WeightedRandomSampler(samples_weight, len(samples_weight), replacement=True)
+                data_loader = DataLoader(dataset, batch_size=self.batch_size, sampler=sampler, pin_memory=True)
+            else:
+                data_loader = DataLoader(dataset, batch_size=self.batch_size, shuffle=True, pin_memory=True)
+
+
             optimizer = self.exp_lr_scheduler(optimizer, epo, init_lr=lr, lr_decay_rate=lr_decay_rate,
                                               lr_decay_epoch=lr_decay_epoch)
 
@@ -204,12 +213,10 @@ class RRL:
                 X = X.cuda(self.device_id, non_blocking=True)
                 y = y.cuda(self.device_id, non_blocking=True)
                 optimizer.zero_grad()  # Zero the gradient buffers.
-                
+
                 # trainable softmax temperature
                 y_bar = self.net.forward(X) / torch.exp(self.net.t)
-                #y_bar = y_bar[:, 1]
                 y_arg = torch.argmax(y, dim=1)
-
                 loss_rrl = self.criterion(y_bar, y_arg) + weight_decay * self.l2_penalty()
                 
                 ba_loss_rrl = loss_rrl.item()
@@ -236,6 +243,7 @@ class RRL:
                 self.clip()
 
                 if self.is_rank0 and (cnt % (TEST_CNT_MOD * 10) == 0):
+                    print(f"Intermediate Test at Iteration {cnt}")
                     if valid_loader is not None:
                         acc_b, f1_b, pr_b, rec_b = self.test(test_loader=valid_loader, set_name='Validation')
 
@@ -299,6 +307,31 @@ class RRL:
         optimizer.step(closure)
         print(f"Optimal temperature: {torch.exp(self.net.t).item():.4f}")
 
+    def fit_threshold(self, valid_loader, max_iter=200, metric="f1"):
+        logits, labels = self.collect_logits_labels(valid_loader)
+        if labels.ndim > 1:
+            labels = torch.argmax(labels, dim=1)
+        probs = torch.softmax(logits / torch.exp(self.net.t), dim=1)[:, 1]
+        thresholds = np.linspace(0.0, 1.0, max_iter)
+        best_score, best_thresh = -1, 0.5
+        labels = labels.cpu().numpy()
+        for t in thresholds:
+            preds = (probs >= t).int().cpu().numpy()
+            if metric == "f1":
+                score = metrics.f1_score(labels, preds, average='binary')
+            elif metric == "precision":
+                score = metrics.precision_score(labels, preds, average='binary')
+            elif metric == "recall":
+                score = metrics.recall_score(labels, preds, average='binary')
+            else:
+                raise ValueError(f"Unsupported metric {metric}")
+            if score > best_score:
+                best_score, best_thresh = score, t
+
+        print(f"Best threshold for {metric.upper()}: {best_thresh:.3f} (score={best_score:.4f})")
+        self.best_threshold = best_thresh
+        return best_thresh
+
 
     @torch.no_grad()
     def test(self, test_loader=None, set_name='Validation'):
@@ -306,8 +339,12 @@ class RRL:
             raise Exception("Data loader is unavailable!")
 
         y_list = []
+        y_pred_b_list = []
         for X, y in test_loader:
             y_list.append(y)
+            X = X.cuda(self.device_id, non_blocking=True)
+            output = self.net.forward(X) / torch.exp(self.net.t)
+            y_pred_b_list.append(output)
         y_true = torch.cat(y_list, dim=0)
         y_true = y_true.cpu().numpy().astype(np.int)
         y_true = np.argmax(y_true, axis=1)
@@ -316,16 +353,15 @@ class RRL:
         slice_step = data_num // 40 if data_num >= 40 else 1
         logging.debug('y_true: {} {}'.format(y_true.shape, y_true[:: slice_step]))
 
-        y_pred_b_list = []
-        for X, y in test_loader:
-            X = X.cuda(self.device_id, non_blocking=True)
-            output = self.net.forward(X) / torch.exp(self.net.t)
-            y_pred_b_list.append(output)
-
-        y_pred_b = torch.cat(y_pred_b_list).cpu().numpy()
-        y_pred_b_arg = np.argmax(y_pred_b, axis=1)
+        y_pred_b = torch.cat(y_pred_b_list)
+        if hasattr(self, 'best_threshold'):
+            probs = torch.softmax(y_pred_b, dim=1)[:, 1]
+            y_pred_b_arg = (probs >= self.best_threshold).long().cpu().numpy()
+            print(f"Using best threshold {self.best_threshold} for prediction.")
+        else:
+            y_pred_b_arg = np.argmax(y_pred_b.cpu().numpy(), axis=1)
         logging.debug('y_rrl_: {} {}'.format(y_pred_b_arg.shape, y_pred_b_arg[:: slice_step]))
-        logging.debug('y_rrl: {} {}'.format(y_pred_b.shape, y_pred_b[:: (slice_step)]))
+        #logging.debug('y_rrl: {} {}'.format(y_pred_b.shape, y_pred_b[:: (slice_step)]))
 
         accuracy_b = metrics.accuracy_score(y_true, y_pred_b_arg)
         f1_score_b = metrics.f1_score(y_true, y_pred_b_arg, average='binary')
